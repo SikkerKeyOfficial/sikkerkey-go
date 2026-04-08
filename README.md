@@ -1,6 +1,6 @@
 # SikkerKey Go SDK
 
-The official Go SDK for [SikkerKey](https://sikkerkey.com) — read secrets from your vault using Ed25519 machine authentication.
+The official Go SDK for [SikkerKey](https://sikkerkey.com). Read-only access to secrets in a SikkerKey vault using Ed25519 machine authentication. Zero external dependencies — standard library only.
 
 ## Installation
 
@@ -8,15 +8,13 @@ The official Go SDK for [SikkerKey](https://sikkerkey.com) — read secrets from
 go get github.com/SikkerKeyOfficial/sikkerkey-go@latest
 ```
 
-## Prerequisites
+## How It Works
 
-The machine must be registered with SikkerKey via the CLI:
+The SDK reads an `identity.json` file from the local filesystem. This file is created during machine bootstrap and contains the machine ID, vault ID, API URL, and path to the Ed25519 private key. Every API request is signed with the private key — no API keys, no tokens, no sessions.
 
-```bash
-sikkerkey connect <vault-id>
-```
+Default identity location: `~/.sikkerkey/vaults/<vault-id>/identity.json`
 
-The machine identity (Ed25519 keypair) is stored locally and used by the SDK for authentication. No API keys, no tokens.
+Override with the `SIKKERKEY_IDENTITY` environment variable or pass a direct path to `New()`.
 
 ## Quick Start
 
@@ -31,48 +29,41 @@ import (
 )
 
 func main() {
-    // Connect using a specific vault
     sk, err := sikkerkey.New("vault_abc123")
     if err != nil {
         log.Fatal(err)
     }
 
-    // Read a secret
-    apiKey, err := sk.GetSecret("sk_stripe_key")
+    secret, err := sk.GetSecret("sk_stripe_key")
     if err != nil {
         log.Fatal(err)
     }
-    fmt.Println(apiKey)
+    fmt.Println(secret)
 }
 ```
 
-## Auto-Detection
-
-If the machine has only one vault configured, or the `SIKKERKEY_VAULT` environment variable is set:
+## Client Creation
 
 ```go
-sk, err := sikkerkey.NewAutoDetect()
-```
-
-## API
-
-### Client Creation
-
-```go
-// Connect to a specific vault
+// Explicit vault ID
 sk, err := sikkerkey.New("vault_abc123")
 
-// Auto-detect vault from environment or single-vault config
+// Direct path to identity.json
+sk, err := sikkerkey.New("/etc/sikkerkey/vaults/vault_abc123/identity.json")
+
+// Auto-detect: uses SIKKERKEY_IDENTITY env, or finds the single vault on disk
 sk, err := sikkerkey.NewAutoDetect()
 ```
 
-### Reading Secrets
+Auto-detection fails with a clear error if multiple vaults are registered and no vault is specified.
+
+## Reading Secrets
 
 ```go
 // Single-value secret
 value, err := sk.GetSecret("sk_api_key")
 
-// Structured secret — all fields
+// Structured secret — all fields as map[string]string
 fields, err := sk.GetFields("sk_db_credentials")
 host := fields["host"]
 password := fields["password"]
@@ -81,64 +72,94 @@ password := fields["password"]
 password, err := sk.GetField("sk_db_credentials", "password")
 ```
 
-### Listing Secrets
+`GetFields` parses the secret value as JSON. Returns an error if the secret is not a structured secret.
+
+## Listing Secrets
 
 ```go
-// All accessible secrets
+// All secrets this machine can access
 secrets, err := sk.ListSecrets()
 for _, s := range secrets {
-    fmt.Printf("%s: %s\n", s.ID, s.Name)
+    fmt.Printf("%s  %s\n", s.ID, s.Name)
 }
 
 // Secrets in a specific project
-secrets, err := sk.ListSecretsByProject("proj_abc123")
+secrets, err := sk.ListSecretsByProject("proj_production")
 ```
 
-### Exporting
+Each `SecretListItem` has `ID`, `Name`, `FieldNames` (nil for single-value secrets), and `ProjectID`.
+
+## Exporting
 
 ```go
-// Export all secrets as a map (key=secret name, value=secret value)
-env, err := sk.Export("proj_abc123")
+// Export all secrets as env-style key-value pairs
+env, err := sk.Export("")
+
+// Export secrets from a specific project
+env, err := sk.Export("proj_production")
+
 for key, value := range env {
     fmt.Printf("%s=%s\n", key, value)
 }
 ```
 
-### Machine Info
+Secret names are converted to uppercase environment variable format: `Database Credentials` becomes `DATABASE_CREDENTIALS`. Structured secret fields are flattened: `DATABASE_CREDENTIALS_HOST`, `DATABASE_CREDENTIALS_PASSWORD`.
+
+## Machine Info
 
 ```go
-sk.MachineID()    // UUID
-sk.MachineName()  // e.g. "api-server-1"
-sk.VaultID()      // e.g. "vault_abc123"
-sk.APIURL()       // e.g. "https://api.sikkerkey.com"
+sk.MachineID()    // "550e8400-e29b-41d4-a716-446655440000"
+sk.MachineName()  // "api-server-1"
+sk.VaultID()      // "vault_abc123"
+sk.APIURL()       // "https://api.sikkerkey.com"
 ```
 
-### Listing Vaults
+## Listing Vaults
 
 ```go
-// List all configured vault IDs on this machine
+// All vault IDs registered on this machine
 vaults := sikkerkey.ListVaults()
+// ["vault_abc123", "vault_def456"]
 ```
 
-## Authentication
+## Error Handling
 
-Every request is signed with the machine's Ed25519 private key. The signature covers the HTTP method, path, timestamp, nonce, and body hash. The server verifies the signature against the machine's registered public key.
+All errors are prefixed with `sikkerkey:` and include context:
 
-No secrets, tokens, or API keys are transmitted. The private key never leaves the machine.
+- `sikkerkey: authentication failed` — invalid signature or machine not approved
+- `sikkerkey: access denied` — machine doesn't have access to this secret
+- `sikkerkey: not found` — secret doesn't exist
+- `sikkerkey: server sealed` — server needs to be unsealed
+- `sikkerkey: rate limited` — too many requests
+- `sikkerkey: no identity found` — identity.json not found at the expected path
+
+Network errors and 429/503 responses are retried up to 3 times with exponential backoff (1s, 2s, 4s).
 
 ## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `SIKKERKEY_VAULT` | Override vault ID for auto-detection |
-| `SIKKERKEY_HOME` | Override config directory (default: `~/.sikkerkey`) |
-| `SIKKERKEY_IDENTITY` | Override path to identity file |
+| `SIKKERKEY_IDENTITY` | Path to `identity.json` — overrides vault-based lookup |
+| `SIKKERKEY_HOME` | Base directory for config (default: `~/.sikkerkey`) |
+| `SIKKERKEY_VAULT` | Not used by the SDK directly — use `New("vault_id")` instead |
+
+## Authentication
+
+Every request includes four headers signed with Ed25519:
+
+- `X-Machine-Id` — machine UUID
+- `X-Timestamp` — Unix timestamp (±5 minute window)
+- `X-Nonce` — random base64 nonce (replay protection)
+- `X-Signature` — Ed25519 signature of `method:path:timestamp:nonce:bodyHash`
+
+The private key is read from the PEM file referenced in `identity.json`. It never leaves the machine. HTTPS is enforced for all non-localhost connections.
 
 ## Documentation
 
 - [SDK Overview](https://docs.sikkerkey.com/docs/sdk/overview)
 - [Go SDK Reference](https://docs.sikkerkey.com/docs/sdk/go)
 - [Machine Authentication](https://docs.sikkerkey.com/docs/machines/signatures)
+- [Ed25519 Signatures](https://docs.sikkerkey.com/docs/machines/signatures)
 
 ## License
 
