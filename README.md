@@ -1,6 +1,10 @@
 # SikkerKey Go SDK
 
-The official Go SDK for [SikkerKey](https://sikkerkey.com). Read-only access to secrets in a SikkerKey vault using Ed25519 machine authentication. Zero external dependencies — standard library only.
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Go Reference](https://pkg.go.dev/badge/github.com/SikkerKeyOfficial/sikkerkey-go.svg)](https://pkg.go.dev/github.com/SikkerKeyOfficial/sikkerkey-go)
+[![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go&logoColor=white)](https://go.dev)
+
+The official Go SDK for [SikkerKey](https://sikkerkey.com). Read-only access to secrets in a SikkerKey vault using Ed25519 machine authentication. Zero external dependencies - standard library only.
 
 ## Installation
 
@@ -163,4 +167,4 @@ The private key is read from the PEM file referenced in `identity.json`. It neve
 
 ## License
 
-Proprietary. See [sikkerkey.com/terms](https://sikkerkey.com/terms) for details.
+MIT - see [LICENSE](LICENSE) for details.
