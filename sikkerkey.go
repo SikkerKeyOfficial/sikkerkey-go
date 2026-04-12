@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -46,6 +47,12 @@ func getVaultsDir() string { return filepath.Join(getBaseDir(), "vaults") }
 type Client struct {
 	identity   identity
 	privateKey ed25519.PrivateKey
+
+	watchMu       sync.Mutex
+	watchers      map[string]func(WatchEvent)
+	pollInterval  time.Duration
+	pollStop      chan struct{}
+	pollRunning   bool
 }
 
 type identity struct {
@@ -236,6 +243,218 @@ func ListVaults() []string {
 		}
 	}
 	return vaults
+}
+
+// ── Watch ──
+
+// WatchStatus represents the status of a watched secret change.
+type WatchStatus string
+
+const (
+	// WatchStatusChanged indicates the secret value was updated.
+	WatchStatusChanged WatchStatus = "changed"
+	// WatchStatusDeleted indicates the secret was deleted.
+	WatchStatusDeleted WatchStatus = "deleted"
+	// WatchStatusAccessDenied indicates access to the secret was revoked.
+	WatchStatusAccessDenied WatchStatus = "access_denied"
+	// WatchStatusError indicates an error occurred while polling or fetching.
+	WatchStatusError WatchStatus = "error"
+)
+
+// WatchEvent is delivered to a Watch callback when a secret changes.
+type WatchEvent struct {
+	SecretID string            // The secret that changed
+	Status   WatchStatus       // What happened
+	Value    string            // New decrypted value for CHANGED, empty otherwise
+	Fields   map[string]string // Parsed fields for structured secrets, nil for simple
+	Error    string            // Error message for ERROR status
+}
+
+// Watch registers a callback that fires whenever the given secret changes.
+// The poll goroutine is started lazily on the first call.
+func (c *Client) Watch(secretID string, callback func(WatchEvent)) {
+	c.watchMu.Lock()
+	defer c.watchMu.Unlock()
+
+	if c.watchers == nil {
+		c.watchers = make(map[string]func(WatchEvent))
+	}
+	if c.pollInterval == 0 {
+		c.pollInterval = 15 * time.Second
+	}
+
+	c.watchers[secretID] = callback
+
+	if !c.pollRunning {
+		c.pollStop = make(chan struct{})
+		c.pollRunning = true
+		go c.pollLoop()
+	}
+}
+
+// Unwatch removes the callback for a secret. If no watches remain, polling stops.
+func (c *Client) Unwatch(secretID string) {
+	c.watchMu.Lock()
+	defer c.watchMu.Unlock()
+
+	delete(c.watchers, secretID)
+
+	if len(c.watchers) == 0 && c.pollRunning {
+		close(c.pollStop)
+		c.pollRunning = false
+	}
+}
+
+// SetPollInterval sets the polling interval in seconds. Minimum 10 seconds.
+func (c *Client) SetPollInterval(seconds int) {
+	if seconds < 10 {
+		seconds = 10
+	}
+	c.watchMu.Lock()
+	c.pollInterval = time.Duration(seconds) * time.Second
+	c.watchMu.Unlock()
+}
+
+// Close stops the poll goroutine and clears all watches.
+func (c *Client) Close() {
+	c.watchMu.Lock()
+	defer c.watchMu.Unlock()
+
+	if c.pollRunning {
+		close(c.pollStop)
+		c.pollRunning = false
+	}
+	c.watchers = nil
+}
+
+// pollLoop is the background goroutine that polls for secret changes.
+func (c *Client) pollLoop() {
+	c.watchMu.Lock()
+	interval := c.pollInterval
+	c.watchMu.Unlock()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.pollStop:
+			return
+		case <-ticker.C:
+			c.pollOnce()
+
+			// Check if interval changed and reset ticker if so
+			c.watchMu.Lock()
+			newInterval := c.pollInterval
+			c.watchMu.Unlock()
+			if newInterval != interval {
+				interval = newInterval
+				ticker.Reset(interval)
+			}
+		}
+	}
+}
+
+// pollOnce performs a single poll cycle.
+func (c *Client) pollOnce() {
+	c.watchMu.Lock()
+	ids := make([]string, 0, len(c.watchers))
+	for id := range c.watchers {
+		ids = append(ids, id)
+	}
+	c.watchMu.Unlock()
+
+	if len(ids) == 0 {
+		return
+	}
+
+	payload, _ := json.Marshal(map[string][]string{"watch": ids})
+	body, err := c.request("POST", "/v1/secrets/poll", payload, http.StatusOK)
+	if err != nil {
+		// Fire error event on all watchers
+		c.watchMu.Lock()
+		callbacks := make(map[string]func(WatchEvent), len(c.watchers))
+		for id, cb := range c.watchers {
+			callbacks[id] = cb
+		}
+		c.watchMu.Unlock()
+
+		for id, cb := range callbacks {
+			cb(WatchEvent{
+				SecretID: id,
+				Status:   WatchStatusError,
+				Error:    err.Error(),
+			})
+		}
+		return
+	}
+
+	var resp struct {
+		Changes map[string]struct {
+			Status string `json:"status"`
+		} `json:"changes"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return
+	}
+
+	for id, change := range resp.Changes {
+		status := WatchStatus(change.Status)
+
+		c.watchMu.Lock()
+		cb, ok := c.watchers[id]
+		c.watchMu.Unlock()
+		if !ok {
+			continue
+		}
+
+		switch status {
+		case WatchStatusChanged:
+			value, fetchErr := c.GetSecret(id)
+			if fetchErr != nil {
+				cb(WatchEvent{
+					SecretID: id,
+					Status:   WatchStatusError,
+					Error:    fetchErr.Error(),
+				})
+				continue
+			}
+
+			var fields map[string]string
+			if json.Unmarshal([]byte(value), &fields) != nil {
+				fields = nil
+			}
+
+			cb(WatchEvent{
+				SecretID: id,
+				Status:   WatchStatusChanged,
+				Value:    value,
+				Fields:   fields,
+			})
+
+		case WatchStatusDeleted, WatchStatusAccessDenied:
+			cb(WatchEvent{
+				SecretID: id,
+				Status:   status,
+			})
+
+			// Remove from watchers - access is gone
+			c.watchMu.Lock()
+			delete(c.watchers, id)
+			if len(c.watchers) == 0 && c.pollRunning {
+				close(c.pollStop)
+				c.pollRunning = false
+			}
+			c.watchMu.Unlock()
+
+		default:
+			cb(WatchEvent{
+				SecretID: id,
+				Status:   WatchStatusError,
+				Error:    fmt.Sprintf("unknown poll status: %s", change.Status),
+			})
+		}
+	}
 }
 
 // ── Internal ──

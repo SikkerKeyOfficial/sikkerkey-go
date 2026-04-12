@@ -109,6 +109,56 @@ for key, value := range env {
 
 Secret names are converted to uppercase environment variable format: `Database Credentials` becomes `DATABASE_CREDENTIALS`. Structured secret fields are flattened: `DATABASE_CREDENTIALS_HOST`, `DATABASE_CREDENTIALS_PASSWORD`.
 
+## Watching for Changes
+
+Watch secrets for real-time updates. When a secret is rotated, updated, or deleted, the callback fires with the new value. Polling happens on a background goroutine - your application is never blocked.
+
+```go
+sk.Watch("sk_db_password", func(event sikkerkey.WatchEvent) {
+    switch event.Status {
+    case sikkerkey.WatchStatusChanged:
+        fmt.Printf("New value: %s\n", event.Value)
+        // Structured secrets include parsed fields
+        fmt.Printf("Fields: %v\n", event.Fields)
+    case sikkerkey.WatchStatusDeleted:
+        fmt.Println("Secret was deleted")
+    case sikkerkey.WatchStatusAccessDenied:
+        fmt.Println("Access revoked")
+    case sikkerkey.WatchStatusError:
+        fmt.Printf("Error: %s\n", event.Error)
+    }
+})
+```
+
+### Practical Example
+
+```go
+// Auto-rotate database credentials
+sk.Watch("sk_db_credentials", func(event sikkerkey.WatchEvent) {
+    if event.Status == sikkerkey.WatchStatusChanged {
+        db.Reconfigure(event.Fields["username"], event.Fields["password"])
+    }
+})
+```
+
+### Poll Interval
+
+The default poll interval is 15 seconds. The server enforces a minimum of 10 seconds.
+
+```go
+sk.SetPollInterval(30) // seconds
+```
+
+### Stop Watching
+
+```go
+// Stop watching a specific secret
+sk.Unwatch("sk_db_password")
+
+// Stop all watches and shut down polling
+sk.Close()
+```
+
 ## Machine Info
 
 ```go
