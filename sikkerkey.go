@@ -30,6 +30,8 @@ import (
 	"time"
 )
 
+const defaultAPIURL = "https://api.sikkerkey.com"
+
 func getBaseDir() string {
 	if env := os.Getenv("SIKKERKEY_HOME"); env != "" {
 		return env
@@ -84,6 +86,154 @@ func NewAutoDetect() (*Client, error) {
 		return nil, err
 	}
 	return loadFromFile(idFile)
+}
+
+// BootstrapOptions configures an in-memory bootstrap.
+type BootstrapOptions struct {
+	// Hostname recorded on the enrolled machine. If empty, $HOSTNAME, then "serverless".
+	// Must match the enrollment token's hostname pattern if one is set.
+	Hostname string
+	// Name requested for the machine. Overridden when the enrollment token defines a name pattern.
+	Name string
+}
+
+// BootstrapInMemory enrolls an ephemeral machine in memory and returns a ready client,
+// for serverless and other read-only-filesystem environments that have no identity on disk.
+//
+// It generates an Ed25519 keypair in memory, registers an ephemeral machine using the
+// enrollment token, and returns a client whose identity lives only in process memory —
+// nothing is written to disk. Enrollment happens once, here. The returned client then
+// behaves exactly like one created with New: it signs each read with the in-memory key.
+//
+// The ephemeral machine lives for the lifetime set on the enrollment token; reading after
+// it expires returns an authentication error, so size the token's machine lifetime to the
+// workload. The common path is to read secrets at startup and hold the values.
+func BootstrapInMemory(vaultID, token string, opts ...BootstrapOptions) (*Client, error) {
+	if vaultID == "" {
+		return nil, fmt.Errorf("sikkerkey: BootstrapInMemory requires a vault ID")
+	}
+	if token == "" {
+		return nil, fmt.Errorf("sikkerkey: BootstrapInMemory requires an enrollment token")
+	}
+
+	var opt BootstrapOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+
+	// SikkerKey is a managed service; the API URL is fixed. The env override is for local dev only.
+	apiURL := defaultAPIURL
+	if env := os.Getenv("SIKKERKEY_API_URL"); env != "" {
+		apiURL = env
+	}
+	if !strings.HasPrefix(apiURL, "https://") && !strings.HasPrefix(apiURL, "http://localhost") {
+		return nil, fmt.Errorf("sikkerkey: API URL must use HTTPS: %s. Use http://localhost only for local development", apiURL)
+	}
+	apiURL = strings.TrimRight(apiURL, "/")
+
+	// Generate the keypair in memory. The private key never leaves this process.
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("sikkerkey: failed to generate keypair: %w", err)
+	}
+	// Server expects the raw 32-byte public key as standard base64 (44 chars).
+	publicKeyB64 := base64.StdEncoding.EncodeToString(pub)
+
+	hostname := opt.Hostname
+	if hostname == "" {
+		hostname = os.Getenv("HOSTNAME")
+	}
+	if hostname == "" {
+		hostname = "serverless"
+	}
+
+	resp, err := enrollRegister(apiURL, vaultID, token, publicKeyB64, hostname, opt.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Client{
+		identity: identity{
+			MachineID:   resp.MachineID,
+			MachineName: resp.MachineName,
+			VaultID:     resp.VaultID,
+			APIURL:      apiURL,
+		},
+		privateKey: priv,
+	}, nil
+}
+
+type enrollResponse struct {
+	MachineID   string `json:"machineId"`
+	MachineName string `json:"machineName"`
+	VaultID     string `json:"vaultId"`
+	ExpiresAt   int64  `json:"expiresAt"`
+}
+
+func enrollRegister(apiURL, vaultID, token, publicKey, hostname, name string) (*enrollResponse, error) {
+	reqBody := map[string]string{
+		"token":     token,
+		"publicKey": publicKey,
+		"hostname":  hostname,
+	}
+	if name != "" {
+		reqBody["name"] = name
+	}
+	payload, _ := json.Marshal(reqBody)
+
+	url := apiURL + "/v1/" + vaultID + "/enroll/register"
+	req, err := http.NewRequest("POST", url, strings.NewReader(string(payload)))
+	if err != nil {
+		return nil, fmt.Errorf("sikkerkey: failed to create enrollment request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	httpClient := &http.Client{Timeout: 15 * time.Second}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("sikkerkey: enrollment request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("sikkerkey: failed to read enrollment response: %w", err)
+	}
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		var er enrollResponse
+		if err := json.Unmarshal(respBody, &er); err != nil {
+			return nil, fmt.Errorf("sikkerkey: failed to parse enrollment response: %w", err)
+		}
+		if er.MachineID == "" || er.VaultID == "" {
+			return nil, fmt.Errorf("sikkerkey: malformed enrollment response")
+		}
+		return &er, nil
+	}
+
+	var errResp struct {
+		Error string `json:"error"`
+	}
+	errMsg := string(respBody)
+	if json.Unmarshal(respBody, &errResp) == nil && errResp.Error != "" {
+		errMsg = errResp.Error
+	}
+	switch resp.StatusCode {
+	case http.StatusUnauthorized:
+		return nil, fmt.Errorf("sikkerkey: authentication failed: %s", errMsg)
+	case http.StatusForbidden:
+		return nil, fmt.Errorf("sikkerkey: access denied: %s", errMsg)
+	case http.StatusNotFound:
+		return nil, fmt.Errorf("sikkerkey: not found: %s", errMsg)
+	case http.StatusConflict:
+		return nil, fmt.Errorf("sikkerkey: conflict: %s", errMsg)
+	case http.StatusTooManyRequests:
+		return nil, fmt.Errorf("sikkerkey: rate limited: %s", errMsg)
+	case http.StatusServiceUnavailable:
+		return nil, fmt.Errorf("sikkerkey: server sealed: %s", errMsg)
+	default:
+		return nil, fmt.Errorf("sikkerkey: enrollment failed (%d): %s", resp.StatusCode, errMsg)
+	}
 }
 
 // MachineID returns the machine's UUID.

@@ -4,7 +4,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/SikkerKeyOfficial/sikkerkey-go.svg)](https://pkg.go.dev/github.com/SikkerKeyOfficial/sikkerkey-go)
 [![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go&logoColor=white)](https://go.dev)
 
-The official Go SDK for [SikkerKey](https://sikkerkey.com). Read-only access to secrets in a SikkerKey vault using Ed25519 machine authentication. Zero external dependencies - standard library only.
+The official Go SDK for [SikkerKey](https://sikkerkey.com). Read-only access to secrets in a SikkerKey vault using Ed25519 machine authentication. Zero external dependencies - standard library only. Runs on persistent hosts (identity on disk) and serverless or ephemeral environments (in-memory bootstrap).
 
 ## Installation
 
@@ -60,6 +60,49 @@ sk, err := sikkerkey.NewAutoDetect()
 ```
 
 Auto-detection fails with a clear error if multiple vaults are registered and no vault is specified.
+
+## Serverless (In-Memory Bootstrap)
+
+On a long-lived host the SDK loads a persistent identity from disk. Serverless and other ephemeral or read-only-filesystem environments (AWS Lambda, Google Cloud Run, Fly.io, and similar) have no identity to persist. `BootstrapInMemory` handles that case: it generates an Ed25519 keypair in memory, registers an ephemeral machine with an enrollment token, and returns a ready client. Nothing is written to disk.
+
+```go
+sk, err := sikkerkey.BootstrapInMemory(
+    os.Getenv("SIKKERKEY_VAULT_ID"),
+    os.Getenv("SIKKERKEY_ENROLLMENT_TOKEN"),
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+dbURL, err := sk.GetSecret("sk_db_prod")
+```
+
+Create an enrollment token in the dashboard and supply its plaintext plus your vault ID. The token only registers an ephemeral machine scoped to the policy you set (projects, secrets, lifetime); it cannot read secrets on its own.
+
+Enrollment happens once, in the `BootstrapInMemory` call. The returned `*Client` then behaves exactly like one from `New`: it signs each read with the in-memory key. The private key is gone when the process exits. The ephemeral machine lives for the lifetime set on the token; reading after it expires returns an authentication error, so size the token's machine lifetime to your workload. The common path is to read secrets at startup and hold the values.
+
+### Options
+
+Pass an optional `BootstrapOptions` to label the machine:
+
+```go
+sk, err := sikkerkey.BootstrapInMemory(vaultID, token, sikkerkey.BootstrapOptions{
+    Hostname: "worker-1",     // defaults to $HOSTNAME, then "serverless"
+    Name:     "batch-runner", // overridden if the token defines a name pattern
+})
+```
+
+### Provisioning the Token
+
+When you create the enrollment token for a serverless or ephemeral deployment:
+
+- Set a short machine lifetime (minutes). Each cold start mints a fresh ephemeral machine, and short-lived ones free their slot quickly as they expire.
+- Set max-uses high enough for your cold-start and concurrency volume.
+- Leave the source-CIDR restriction unset, since serverless egress IPs are dynamic.
+- If the vault has an IP allowlist, make sure it permits the platform's egress or leave it off.
+- Set a name pattern on the token (for example `worker-{uuid8}`) so each machine gets a unique name. A name pattern takes precedence over `Name`.
+
+Each live ephemeral machine counts against your plan's machine limit until it expires.
 
 ## Reading Secrets
 
