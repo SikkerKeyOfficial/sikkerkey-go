@@ -152,12 +152,20 @@ func BootstrapInMemory(vaultID, token string, opts ...BootstrapOptions) (*Client
 		return nil, err
 	}
 
+	// Enrollment ran against the backend (apiURL); runtime reads go to the
+	// retrieval plane the backend hands back. Fall back to the enroll URL only
+	// if an older endpoint omits it.
+	readURL := resp.APIURL
+	if readURL == "" {
+		readURL = apiURL
+	}
+
 	return &Client{
 		identity: identity{
 			MachineID:   resp.MachineID,
 			MachineName: resp.MachineName,
 			VaultID:     resp.VaultID,
-			APIURL:      apiURL,
+			APIURL:      readURL,
 		},
 		privateKey: priv,
 	}, nil
@@ -168,6 +176,8 @@ type enrollResponse struct {
 	MachineName string `json:"machineName"`
 	VaultID     string `json:"vaultId"`
 	ExpiresAt   int64  `json:"expiresAt"`
+	// Retrieval-plane base URL (the machine-service); stored as the identity's read URL.
+	APIURL string `json:"apiUrl"`
 }
 
 func enrollRegister(apiURL, vaultID, token, publicKey, hostname, name string) (*enrollResponse, error) {
