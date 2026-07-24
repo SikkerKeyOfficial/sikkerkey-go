@@ -20,6 +20,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -50,11 +51,78 @@ type Client struct {
 	identity   identity
 	privateKey ed25519.PrivateKey
 
-	watchMu       sync.Mutex
-	watchers      map[string]func(WatchEvent)
-	pollInterval  time.Duration
-	pollStop      chan struct{}
-	pollRunning   bool
+	watchMu      sync.Mutex
+	watchers     map[string]func(WatchEvent)
+	pollInterval time.Duration
+	pollStop     chan struct{}
+	pollRunning  bool
+
+	// Off until EnableCache is called. When off, a read touches no cache code and
+	// the key below is never derived.
+	cacheEnabled  bool
+	cacheOpts     CacheOptions
+	cacheInstance *secretCache
+}
+
+// CacheOptions configures the on-disk fallback cache (see Client.EnableCache).
+type CacheOptions struct {
+	// MaxAge, if > 0, is the oldest a cached value may be to still be served during
+	// an outage. Zero means no expiry.
+	MaxAge time.Duration
+	// OnFallback, if set, is called when a value is served from the cache — for your
+	// own logging or metrics. The SDK itself emits nothing; a fallback is otherwise
+	// transparent.
+	OnFallback func(secretID string, cachedAt time.Time)
+}
+
+// APIError is an error carrying the HTTP status returned by the SikkerKey API.
+// StatusCode is 0 for a transport-level failure (DNS, refused, TLS, timeout).
+type APIError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *APIError) Error() string { return e.Message }
+
+func newAPIError(code int, errMsg string) *APIError {
+	var m string
+	switch code {
+	case http.StatusUnauthorized:
+		m = "sikkerkey: authentication failed: " + errMsg
+	case http.StatusForbidden:
+		m = "sikkerkey: access denied: " + errMsg
+	case http.StatusNotFound:
+		m = "sikkerkey: not found: " + errMsg
+	case http.StatusConflict:
+		m = "sikkerkey: conflict: " + errMsg
+	case http.StatusTooManyRequests:
+		m = "sikkerkey: rate limited: " + errMsg
+	case http.StatusServiceUnavailable:
+		m = "sikkerkey: service temporarily unavailable: " + errMsg
+	default:
+		m = fmt.Sprintf("sikkerkey: request failed (%d): %s", code, errMsg)
+	}
+	return &APIError{StatusCode: code, Message: m}
+}
+
+// cacheUnavailableStatuses: no authoritative answer reached us from the origin, so
+// the fallback cache may serve — 502/504 (gateway), 503 (temporarily unavailable),
+// 520–527 (the Cloudflare origin-error family), 530 (edge can't reach origin).
+// 401/403/404/429 (authoritative) and 500/501 (origin ran and errored) are excluded.
+var cacheUnavailableStatuses = map[int]bool{
+	502: true, 503: true, 504: true,
+	520: true, 521: true, 522: true, 523: true, 524: true, 525: true, 526: true, 527: true,
+	530: true,
+}
+
+// isUnavailable reports whether err is a transport failure or a gateway/origin
+// unreachable status — the only errors the fallback cache may satisfy.
+func isUnavailable(err error) bool {
+	var ae *APIError
+	if errors.As(err, &ae) {
+		return ae.StatusCode == 0 || cacheUnavailableStatuses[ae.StatusCode]
+	}
+	return false
 }
 
 type identity struct {
@@ -240,7 +308,7 @@ func enrollRegister(apiURL, vaultID, token, publicKey, hostname, name string) (*
 	case http.StatusTooManyRequests:
 		return nil, fmt.Errorf("sikkerkey: rate limited: %s", errMsg)
 	case http.StatusServiceUnavailable:
-		return nil, fmt.Errorf("sikkerkey: server sealed: %s", errMsg)
+		return nil, fmt.Errorf("sikkerkey: service temporarily unavailable: %s", errMsg)
 	default:
 		return nil, fmt.Errorf("sikkerkey: enrollment failed (%d): %s", resp.StatusCode, errMsg)
 	}
@@ -258,10 +326,51 @@ func (c *Client) VaultID() string { return c.identity.VaultID }
 // APIURL returns the SikkerKey API URL.
 func (c *Client) APIURL() string { return c.identity.APIURL }
 
+// EnableCache turns on the on-disk fallback cache and returns the client (chainable):
+//
+//	sk, _ := sikkerkey.New("vault_abc123")
+//	sk.EnableCache()
+//
+// While enabled, every secret read is written to an encrypted, identity-bound file
+// under ~/.sikkerkey/vaults/<vault>/cache/, and served from there when the retrieval
+// plane is unreachable (a network failure, or a gateway/origin error like 502/504 or
+// a Cloudflare 52x) — never when the server returns an authoritative answer (access
+// denied, deleted, bad auth). Off by default: until called, a read never touches the cache.
+func (c *Client) EnableCache(opts ...CacheOptions) *Client {
+	c.cacheEnabled = true
+	if len(opts) > 0 {
+		c.cacheOpts = opts[0]
+	}
+	return c
+}
+
 // ── Read ──
 
 // GetSecret fetches a secret by ID and returns the decrypted value.
 func (c *Client) GetSecret(secretID string) (string, error) {
+	// Fast path: caching off → behave exactly as before, touching no cache code.
+	if !c.cacheEnabled {
+		return c.getSecretLive(secretID)
+	}
+	value, err := c.getSecretLive(secretID)
+	if err == nil {
+		_ = c.getCache().store(secretID, "", value, nil) // best-effort; a cache write failure never fails the read
+		return value, nil
+	}
+	if isUnavailable(err) {
+		if hit := c.loadFromCache(secretID); hit != nil {
+			// Transparent by default; the app observes fallback only via OnFallback.
+			if c.cacheOpts.OnFallback != nil {
+				c.cacheOpts.OnFallback(secretID, hit.CachedAt)
+			}
+			return hit.Value, nil
+		}
+	}
+	return "", err
+}
+
+// getSecretLive fetches a secret from the server (the original, uncached path).
+func (c *Client) getSecretLive(secretID string) (string, error) {
 	body, err := c.request("GET", "/v1/secret/"+secretID, nil, http.StatusOK)
 	if err != nil {
 		return "", err
@@ -273,6 +382,26 @@ func (c *Client) GetSecret(secretID string) (string, error) {
 		return "", fmt.Errorf("sikkerkey: failed to parse response: %w", err)
 	}
 	return resp.Value, nil
+}
+
+// getCache lazily builds the cache, deriving its key from the Ed25519 seed on first use.
+func (c *Client) getCache() *secretCache {
+	if c.cacheInstance == nil {
+		c.cacheInstance = newSecretCache(c.identity.VaultID, c.identity.MachineID, c.privateKey.Seed())
+	}
+	return c.cacheInstance
+}
+
+// loadFromCache returns a cached entry honoring MaxAge, or nil on miss/expiry/error.
+func (c *Client) loadFromCache(secretID string) *cacheResult {
+	hit, err := c.getCache().load(secretID)
+	if err != nil || hit == nil {
+		return nil
+	}
+	if c.cacheOpts.MaxAge > 0 && time.Since(hit.CachedAt) > c.cacheOpts.MaxAge {
+		return nil
+	}
+	return hit
 }
 
 // GetFields fetches a structured secret and returns its fields as a map.
@@ -673,15 +802,15 @@ func (c *Client) request(method, path string, body []byte, expectStatus int) ([]
 		httpClient := &http.Client{Timeout: 15 * time.Second}
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			// Network error — retry
-			lastErr = fmt.Errorf("sikkerkey: request failed: %w", err)
+			// Network error — retry. StatusCode 0 marks a transport failure.
+			lastErr = &APIError{StatusCode: 0, Message: "sikkerkey: request failed: " + err.Error()}
 			continue
 		}
 
 		respBody, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			lastErr = fmt.Errorf("sikkerkey: failed to read response: %w", err)
+			lastErr = &APIError{StatusCode: 0, Message: "sikkerkey: failed to read response: " + err.Error()}
 			continue
 		}
 
@@ -698,26 +827,11 @@ func (c *Client) request(method, path string, body []byte, expectStatus int) ([]
 		}
 
 		if retryableCodes[resp.StatusCode] && attempt < maxRetries {
-			lastErr = fmt.Errorf("sikkerkey: %s (HTTP %d)", errMsg, resp.StatusCode)
+			lastErr = newAPIError(resp.StatusCode, errMsg)
 			continue
 		}
 
-		switch resp.StatusCode {
-		case http.StatusUnauthorized:
-			return nil, fmt.Errorf("sikkerkey: authentication failed: %s", errMsg)
-		case http.StatusForbidden:
-			return nil, fmt.Errorf("sikkerkey: access denied: %s", errMsg)
-		case http.StatusNotFound:
-			return nil, fmt.Errorf("sikkerkey: not found: %s", errMsg)
-		case http.StatusConflict:
-			return nil, fmt.Errorf("sikkerkey: conflict: %s", errMsg)
-		case http.StatusTooManyRequests:
-			return nil, fmt.Errorf("sikkerkey: rate limited: %s", errMsg)
-		case http.StatusServiceUnavailable:
-			return nil, fmt.Errorf("sikkerkey: server sealed: %s", errMsg)
-		default:
-			return nil, fmt.Errorf("sikkerkey: request failed (%d): %s", resp.StatusCode, errMsg)
-		}
+		return nil, newAPIError(resp.StatusCode, errMsg)
 	}
 
 	if lastErr != nil {
